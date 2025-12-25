@@ -448,48 +448,55 @@ const MountableVolumeAppInfo = GObject.registerClass({
     },
 },
 class MountableVolumeAppInfo extends LocationAppInfo {
+    /**
+     * v7 Pure Data Model: All data is copied at construction time.
+     * NO references to volume/mount GObjects are stored.
+     * NO signals are connected to volume/mount objects.
+     * Updates come from RemovablesManager via refresh() method.
+     */
     _init(volume, cancellable = null) {
         super._init({
             volume,
             cancellable,
         });
 
-        // Cache volume identifiers for safe lookup after disposal.
-        // Also store a direct reference for identity comparison.
-        this._volumeIdentifiers = {
+        // Cache volume identifiers for lookup during actions.
+        // These are immutable after construction.
+        this._volumeId = {
             uuid: volume.get_uuid(),
             device: volume.get_identifier('unix-device'),
-            name: volume.get_name(),
         };
-        // Store direct reference for safe lookup by identity comparison.
-        // We validate this reference is still in VolumeMonitor before using it,
-        // which avoids calling methods on potentially-disposed volumes.
-        this._volumeRef = volume;
-        // Cache the ID string for use in error handlers where we can't
-        // safely access the volume.
-        this._cachedId = this._volumeIdentifiers.uuid
-            ? 'mountable-volume:%s'.format(this._volumeIdentifiers.uuid)
+
+        // Cache the ID string for use everywhere.
+        this._cachedId = this._volumeId.uuid
+            ? 'mountable-volume:%s'.format(this._volumeId.uuid)
             : super.vfunc_get_id();
 
-        this._signalsHandler = new Utils.GlobalSignalsHandler();
+        // Cache static volume properties (don't change during volume lifetime)
+        this._isNetworkVolume = volume.get_identifier('class') === 'network';
 
-        const updateAndMonitor = () => {
-            this._update();
-            this._monitorChanges();
-        };
-        updateAndMonitor();
-        this._mountChanged = this.connect('notify::mount', updateAndMonitor);
+        // Cache current mount state - will be updated via refresh()
+        const mount = volume.get_mount();
+        this._isMounted = !!mount;
 
-        const safeVolume = this._safeVolume;
-        if (!this.mount && safeVolume?.get_identifier?.('class') === 'network') {
-            // For some devices the mount point isn't advertised promptly
-            // even if it's already existing, and there's no signaling about
+        // Set properties from current state
+        this.name = (mount ?? volume).get_name() ?? 'Unknown';
+        this.icon = (mount ?? volume).get_icon();
+        this.location = mount?.get_default_location() ?? volume.get_activation_root();
+        this.mount = mount;
+
+        // For network volumes, schedule a delayed refresh since mount info
+        // may not be immediately available
+        if (!this._isMounted && this._isNetworkVolume) {
             this._lazyUpdater = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
-                this._update();
+                // Request refresh from manager - don't access volume directly
+                this.emit('needs-refresh');
                 delete this._lazyUpdater;
                 return GLib.SOURCE_REMOVE;
             });
         }
+
+        this._updateLocationIcon({custom: true});
     }
 
     get busy() {
@@ -501,48 +508,64 @@ class MountableVolumeAppInfo extends LocationAppInfo {
     }
 
     /**
-     * Safe accessor for volume that validates our stored reference is still
-     * in VolumeMonitor. Returns null if volume is no longer available.
-     *
-     * IMPORTANT: We use reference identity comparison (Array.includes) rather
-     * than calling methods like get_uuid() on volumes in the list. This is
-     * critical because calling methods on a volume that's being disposed by
-     * gvfs can corrupt the heap at the C level before JavaScript exception
-     * handling can intervene.
+     * Look up volume fresh from VolumeMonitor by cached identifiers.
+     * Used only for mount/eject actions where we need a live reference.
+     * Returns null if volume is no longer available.
      */
-    get _safeVolume() {
-        // If invalidated or reference was never stored, return null
-        if (!this._volumeIdentifiers || !this._volumeRef)
+    _lookupVolume() {
+        if (!this._volumeId)
+            return null;
+
+        const {uuid, device} = this._volumeId;
+        if (!uuid && !device)
             return null;
 
         const volumes = Gio.VolumeMonitor.get().get_volumes();
 
-        // Check by reference identity - this does NOT call any methods on the
-        // volume objects, avoiding the risk of accessing a disposed object.
-        // Array.includes uses SameValueZero comparison (like ===).
-        if (volumes.includes(this._volumeRef))
-            return this._volumeRef;
+        // Find by identifier - wrap each access in try/catch in case
+        // a volume in the list is being disposed
+        for (const v of volumes) {
+            try {
+                if (uuid && v.get_uuid() === uuid)
+                    return v;
+                if (device && v.get_identifier('unix-device') === device)
+                    return v;
+            } catch (e) {
+                // Skip volumes that throw - they may be disposed
+                continue;
+            }
+        }
 
-        // Volume not found in monitor - it's been removed
         return null;
     }
 
     /**
-     * Safe accessor for mount. Just returns the stored mount if non-null.
-     * Mount is managed separately and nulled out on unmount.
+     * Refresh cached state from a volume reference.
+     * Called by RemovablesManager when VolumeMonitor signals fire.
+     * The volume parameter is valid during the signal handler execution.
      */
-    get _safeMount() {
-        return this.mount ?? null;
+    refresh(volume) {
+        if (!volume)
+            return;
+
+        const mount = volume.get_mount();
+        this._isMounted = !!mount;
+        this.mount = mount;
+
+        // Update mutable properties
+        this.name = (mount ?? volume).get_name() ?? this.name ?? 'Unknown';
+        this.icon = (mount ?? volume).get_icon() ?? this.icon;
+        this.location = mount?.get_default_location() ?? volume.get_activation_root() ?? this.location;
+
+        this._updateLocationIcon({custom: true});
     }
 
     /**
-     * Called when the volume is being removed. Clears all references and
-     * identifiers so subsequent lookups will return null.
+     * Mark this volume as removed. Called when volume-removed signal fires.
      */
-    invalidateVolume() {
-        this._volumeIdentifiers = null;
-        this._volumeRef = null;
-        this._signalsHandler.destroy();
+    markRemoved() {
+        this._volumeId = null;
+        this._isMounted = false;
         this.mount = null;
     }
 
@@ -551,59 +574,61 @@ class MountableVolumeAppInfo extends LocationAppInfo {
             GLib.source_remove(this._lazyUpdater);
             delete this._lazyUpdater;
         }
-        this.disconnect(this._mountChanged);
         this.mount = null;
-        this._volumeRef = null;
-        this._signalsHandler.destroy();
+        this._volumeId = null;
 
         super.destroy();
     }
 
     vfunc_dup() {
-        const safeVolume = this._safeVolume;
-        if (!safeVolume)
+        // Look up volume fresh for duplication
+        const volume = this._lookupVolume();
+        if (!volume)
             return null;
-        return new MountableVolumeAppInfo({
-            volume: safeVolume,
-            cancellable: this.cancellable,
-        });
+        return new MountableVolumeAppInfo(volume, this.cancellable);
     }
 
     vfunc_get_id() {
-        // Use cached ID to avoid accessing potentially disposed volume
+        // Always use cached ID - no volume access needed
         return this._cachedId ?? super.vfunc_get_id();
     }
 
     vfunc_equal(other) {
-        const safeVolume = this._safeVolume;
-        const otherVolume = other?._safeVolume;
-        if (safeVolume && safeVolume === otherVolume && this.mount === other?.mount)
-            return true;
-
-        return this.get_id() === other?.get_id();
+        // Compare by cached IDs - no volume access needed
+        if (!(other instanceof MountableVolumeAppInfo))
+            return false;
+        return this._cachedId === other._cachedId;
     }
 
     list_actions() {
         const actions = [];
-        const safeMount = this._safeMount;
-        const safeVolume = this._safeVolume;
 
-        if (safeMount) {
-            if (safeMount.can_unmount?.())
-                actions.push(RemovableAction.UNMOUNT);
-            if (safeMount.can_eject?.())
-                actions.push(RemovableAction.EJECT);
-
-            return actions;
+        // Check mount capabilities from cached mount reference
+        // (refreshed via RemovablesManager signals)
+        if (this.mount) {
+            try {
+                if (this.mount.can_unmount?.())
+                    actions.push(RemovableAction.UNMOUNT);
+                if (this.mount.can_eject?.())
+                    actions.push(RemovableAction.EJECT);
+                return actions;
+            } catch (e) {
+                // Mount may have been disposed - fall through to volume check
+            }
         }
 
-        if (!safeVolume)
-            return actions;
-
-        if (safeVolume.can_mount?.())
-            actions.push(RemovableAction.MOUNT);
-        if (safeVolume.can_eject?.())
-            actions.push(RemovableAction.EJECT);
+        // Look up volume fresh for capability check
+        const volume = this._lookupVolume();
+        if (volume) {
+            try {
+                if (volume.can_mount?.())
+                    actions.push(RemovableAction.MOUNT);
+                if (volume.can_eject?.())
+                    actions.push(RemovableAction.EJECT);
+            } catch (e) {
+                // Volume disposed during lookup - return empty actions
+            }
+        }
 
         return actions;
     }
@@ -629,43 +654,9 @@ class MountableVolumeAppInfo extends LocationAppInfo {
         return true;
     }
 
-    _update() {
-        const safeVolume = this._safeVolume;
-        if (!safeVolume) {
-            // Volume no longer available, skip update
-            return;
-        }
-
-        this.mount = safeVolume.get_mount?.();
-
-        const safeMount = this._safeMount;
-        const removable = safeMount ?? safeVolume;
-        this.name = removable.get_name?.() ?? this._volumeIdentifiers?.name ?? 'Unknown';
-        this.icon = removable.get_icon?.();
-
-        this.location = safeMount?.get_default_location?.() ??
-            safeVolume.get_activation_root?.();
-
-        this._updateLocationIcon({custom: true});
-    }
-
-    _monitorChanges() {
-        this._signalsHandler.destroy();
-
-        const safeMount = this._safeMount;
-        const safeVolume = this._safeVolume;
-        const removable = safeMount ?? safeVolume;
-
-        if (!removable)
-            return;
-
-        this._signalsHandler.add(removable, 'changed', () => this._update());
-
-        if (safeMount) {
-            this._signalsHandler.add(safeMount, 'pre-unmount', () => this._update());
-            this._signalsHandler.add(safeMount, 'unmounted', () => this._update());
-        }
-    }
+    // NOTE: _update() and _monitorChanges() removed in v7.
+    // Updates now come from RemovablesManager via refresh() method.
+    // No signals are connected to individual volume/mount objects.
 
     async mountAndLaunch(files, context) {
         if (this.mount)
@@ -687,8 +678,8 @@ class MountableVolumeAppInfo extends LocationAppInfo {
     }
 
     _notifyActionError(action, message) {
-        // Use cached name to avoid accessing potentially disposed volume
-        const name = this.name ?? this._volumeIdentifiers?.name ?? 'device';
+        // Use cached name
+        const name = this.name ?? 'device';
         switch (action) {
         case RemovableAction.MOUNT:
             global.notify_error(__('Failed to mount "%s"'.format(name)), message);
@@ -731,30 +722,31 @@ class MountableVolumeAppInfo extends LocationAppInfo {
             }
         }
 
-        const safeMount = this._safeMount;
-        const safeVolume = this._safeVolume;
-        const removable = safeMount ?? safeVolume;
+        // Look up volume/mount fresh for the action
+        const volume = this._lookupVolume();
+        const mount = this.mount;  // Use cached mount reference
 
-        if (!removable) {
+        if (!volume && !mount) {
             throw new Error('Volume/mount no longer available for action %s'.format(action));
         }
 
         this._currentAction = action;
         this.notify('busy');
+        const removable = mount ?? volume;
         const operation = new ShellMountOperation.ShellMountOperation(removable);
         try {
             switch (action) {
             case RemovableAction.MOUNT:
-                if (!safeVolume)
-                    throw new Error('Volume no longer available for mount');
-                await safeVolume.mount(Gio.MountMountFlags.NONE, operation.mountOp,
+                if (!volume)
+                    throw new Error('Volume not available for mount');
+                await volume.mount(Gio.MountMountFlags.NONE, operation.mountOp,
                     this.cancellable);
                 return true;
 
             case RemovableAction.UNMOUNT:
-                if (!safeMount)
-                    throw new Error('Mount no longer available for unmount');
-                await safeMount.unmount_with_operation(Gio.MountUnmountFlags.FORCE,
+                if (!mount)
+                    throw new Error('Mount not available for unmount');
+                await mount.unmount_with_operation(Gio.MountUnmountFlags.FORCE,
                     operation.mountOp, this.cancellable);
                 return true;
 
@@ -796,7 +788,7 @@ class MountableVolumeAppInfo extends LocationAppInfo {
         } finally {
             delete this._currentAction;
             this.notify('busy');
-            this._update();
+            // State will be updated via VolumeMonitor signals (mount-added/mount-removed)
             operation.close();
         }
     }
@@ -1490,6 +1482,8 @@ export class Removables {
         this._monitor.get_mounts().forEach(m => Removables.initMountPromises(m));
         this._updateVolumes();
 
+        // v7: Connect to all VolumeMonitor signals for state updates.
+        // Individual volume/mount objects are NOT connected to directly.
         this._signalsHandler.add([
             this._monitor,
             'volume-added',
@@ -1500,8 +1494,16 @@ export class Removables {
             (_, volume) => this._onVolumeRemoved(volume),
         ], [
             this._monitor,
+            'volume-changed',
+            (_, volume) => this._onVolumeChanged(volume),
+        ], [
+            this._monitor,
             'mount-added',
             (_, mount) => this._onMountAdded(mount),
+        ], [
+            this._monitor,
+            'mount-removed',
+            (_, mount) => this._onMountRemoved(mount),
         ], [
             Docking.DockManager.settings,
             'changed::show-mounts-only-mounted',
@@ -1537,7 +1539,6 @@ export class Removables {
             volume.get_identifier('class') === 'network')
             return;
 
-
         const mount = volume.get_mount();
         if (mount) {
             if (mount.is_shadowed())
@@ -1561,37 +1562,66 @@ export class Removables {
         volumeApp._signalConnections.add(volumeApp, 'windows-changed',
             () => this.emit('windows-changed', volumeApp));
 
-        if (Docking.DockManager.settings.showMountsOnlyMounted) {
-            // Pass volumeApp directly to avoid accessing appInfo.volume
-            // which could reference a disposed GProxyVolume
-            volumeApp._signalConnections.add(appInfo, 'notify::mount',
-                () => !appInfo.mount && this._removeVolumeApp(volumeApp));
-        }
+        // v7: Handle needs-refresh signal for network volumes
+        volumeApp._signalConnections.add(appInfo, 'needs-refresh',
+            () => this._refreshVolumeAppByIds(appInfo._volumeId));
 
         this._volumeApps.push(volumeApp);
         this.emit('changed');
     }
 
+    /**
+     * Find a volumeApp by volume identifiers (uuid/device).
+     * Returns the volumeApp or null if not found.
+     */
+    _findVolumeAppByIds(uuid, device) {
+        return this._volumeApps.find(({appInfo}) => {
+            const ids = appInfo._volumeId;
+            if (!ids)
+                return false;
+            if (uuid && ids.uuid)
+                return ids.uuid === uuid;
+            if (device && ids.device)
+                return ids.device === device;
+            return false;
+        });
+    }
+
+    /**
+     * Find and refresh a volumeApp by cached identifiers.
+     * Used for delayed refresh requests from network volumes.
+     */
+    _refreshVolumeAppByIds(volumeId) {
+        if (!volumeId)
+            return;
+        const volumeApp = this._findVolumeAppByIds(volumeId.uuid, volumeId.device);
+        if (!volumeApp)
+            return;
+
+        // Look up volume fresh and refresh
+        const volume = volumeApp.appInfo._lookupVolume();
+        if (volume)
+            volumeApp.appInfo.refresh(volume);
+    }
+
     _onVolumeRemoved(volume) {
-        // Match by cached identifiers instead of comparing appInfo.volume
-        // directly, since appInfo.volume could reference a disposed object
+        // Volume is valid during this signal handler
         const volumeUuid = volume.get_uuid?.();
         const volumeDevice = volume.get_identifier?.('unix-device');
 
-        const volumeIndex = this._volumeApps.findIndex(({appInfo}) => {
-            const ids = appInfo._volumeIdentifiers;
-            if (!ids)
-                return false;
-            // Match by UUID if available, otherwise by device path
-            if (volumeUuid && ids.uuid)
-                return ids.uuid === volumeUuid;
-            if (volumeDevice && ids.device)
-                return ids.device === volumeDevice;
-            return false;
-        });
+        const volumeApp = this._findVolumeAppByIds(volumeUuid, volumeDevice);
+        if (volumeApp)
+            this._removeVolumeApp(volumeApp);
+    }
 
-        if (volumeIndex !== -1)
-            this._removeVolumeApp(this._volumeApps[volumeIndex]);
+    _onVolumeChanged(volume) {
+        // Volume is valid during this signal handler - use it to refresh
+        const volumeUuid = volume.get_uuid?.();
+        const volumeDevice = volume.get_identifier?.('unix-device');
+
+        const volumeApp = this._findVolumeAppByIds(volumeUuid, volumeDevice);
+        if (volumeApp)
+            volumeApp.appInfo.refresh(volume);
     }
 
     _removeVolumeApp(volumeApp) {
@@ -1600,9 +1630,8 @@ export class Removables {
             return;
 
         this._volumeApps.splice(volumeIndex, 1);
-        // Invalidate volume reference FIRST to prevent any subsequent access
-        // to the potentially disposed GProxyVolume object
-        volumeApp.appInfo.invalidateVolume();
+        // Mark as removed to prevent any subsequent operations
+        volumeApp.appInfo.markRemoved();
         // Cancel ongoing operations
         volumeApp.appInfo.cancellable?.cancel();
         volumeApp.destroy();
@@ -1612,16 +1641,40 @@ export class Removables {
     _onMountAdded(mount) {
         Removables.initMountPromises(mount);
 
-        if (!Docking.DockManager.settings.showMountsOnlyMounted)
+        // Get the volume for this mount to find matching volumeApp
+        const volume = mount.get_volume();
+        if (!volume)
             return;
 
-        if (!this._volumeApps.find(({appInfo}) => appInfo.mount === mount)) {
-            // In some Gio.Mount implementations the volume may be set after
-            // mount is emitted, so we could just ignore it as we'll get it
-            // later via volume-added
-            const volume = mount.get_volume();
+        const volumeUuid = volume.get_uuid?.();
+        const volumeDevice = volume.get_identifier?.('unix-device');
+
+        const existingApp = this._findVolumeAppByIds(volumeUuid, volumeDevice);
+        if (existingApp) {
+            // Refresh existing volumeApp with new mount state
+            existingApp.appInfo.refresh(volume);
+            this.emit('changed');
+        } else if (Docking.DockManager.settings.showMountsOnlyMounted) {
+            // Create new volumeApp for newly mounted volume
+            this._onVolumeAdded(volume);
+        }
+    }
+
+    _onMountRemoved(mount) {
+        // Find the volumeApp whose mount matches
+        const volumeApp = this._volumeApps.find(({appInfo}) => appInfo.mount === mount);
+        if (!volumeApp)
+            return;
+
+        if (Docking.DockManager.settings.showMountsOnlyMounted) {
+            // Remove the volumeApp when mount is removed
+            this._removeVolumeApp(volumeApp);
+        } else {
+            // Just refresh to clear mount state
+            const volume = volumeApp.appInfo._lookupVolume();
             if (volume)
-                this._onVolumeAdded(volume);
+                volumeApp.appInfo.refresh(volume);
+            this.emit('changed');
         }
     }
 
