@@ -474,15 +474,17 @@ class MountableVolumeAppInfo extends LocationAppInfo {
         // Cache static volume properties (don't change during volume lifetime)
         this._isNetworkVolume = volume.get_identifier('class') === 'network';
 
-        // Cache current mount state - will be updated via refresh()
+        // Cache current mount state as primitives - will be updated via refresh()
+        // NO mount GObject reference is stored to avoid accessing disposed objects
         const mount = volume.get_mount();
         this._isMounted = !!mount;
+        this._canUnmount = mount?.can_unmount?.() ?? false;
+        this._canEject = mount?.can_eject?.() ?? volume.can_eject?.() ?? false;
 
         // Set properties from current state
         this.name = (mount ?? volume).get_name() ?? 'Unknown';
         this.icon = (mount ?? volume).get_icon();
         this.location = mount?.get_default_location() ?? volume.get_activation_root();
-        this.mount = mount;
 
         // For network volumes, schedule a delayed refresh since mount info
         // may not be immediately available
@@ -549,7 +551,8 @@ class MountableVolumeAppInfo extends LocationAppInfo {
 
         const mount = volume.get_mount();
         this._isMounted = !!mount;
-        this.mount = mount;
+        this._canUnmount = mount?.can_unmount?.() ?? false;
+        this._canEject = mount?.can_eject?.() ?? volume.can_eject?.() ?? false;
 
         // Update mutable properties
         this.name = (mount ?? volume).get_name() ?? this.name ?? 'Unknown';
@@ -565,7 +568,8 @@ class MountableVolumeAppInfo extends LocationAppInfo {
     markRemoved() {
         this._volumeId = null;
         this._isMounted = false;
-        this.mount = null;
+        this._canUnmount = false;
+        this._canEject = false;
     }
 
     destroy() {
@@ -573,8 +577,10 @@ class MountableVolumeAppInfo extends LocationAppInfo {
             GLib.source_remove(this._lazyUpdater);
             delete this._lazyUpdater;
         }
-        this.mount = null;
         this._volumeId = null;
+        this._isMounted = false;
+        this._canUnmount = false;
+        this._canEject = false;
 
         super.destroy();
     }
@@ -602,20 +608,16 @@ class MountableVolumeAppInfo extends LocationAppInfo {
     list_actions() {
         const actions = [];
 
-        // Check mount capabilities from cached mount reference
-        // (refreshed via RemovablesManager signals)
-        if (this.mount) {
-            try {
-                if (this.mount.can_unmount?.())
-                    actions.push(RemovableAction.UNMOUNT);
-                if (this.mount.can_eject?.())
-                    actions.push(RemovableAction.EJECT);
-                return actions;
-            } catch (e) {
-                // Mount may have been disposed - fall through to volume check
-            }
+        // Use cached mount state - no GObject method calls needed
+        if (this._isMounted) {
+            if (this._canUnmount)
+                actions.push(RemovableAction.UNMOUNT);
+            if (this._canEject)
+                actions.push(RemovableAction.EJECT);
+            return actions;
         }
 
+        // Not mounted - check if we can mount or eject
         // Look up volume fresh for capability check
         const volume = this._lookupVolume();
         if (volume) {
@@ -646,7 +648,7 @@ class MountableVolumeAppInfo extends LocationAppInfo {
     }
 
     vfunc_launch(files, context) {
-        if (this.mount || files?.length)
+        if (this._isMounted || files?.length)
             return super.vfunc_launch(files, context);
 
         this.mountAndLaunch(files, context);
@@ -658,12 +660,12 @@ class MountableVolumeAppInfo extends LocationAppInfo {
     // No signals are connected to individual volume/mount objects.
 
     async mountAndLaunch(files, context) {
-        if (this.mount)
+        if (this._isMounted)
             return super.vfunc_launch(files, context);
 
         try {
             await this.launchAction(RemovableAction.MOUNT);
-            if (!this.mount) {
+            if (!this._isMounted) {
                 throw new Error('No mounted location to open for %s'.format(
                     this._cachedId));
             }
@@ -721,9 +723,9 @@ class MountableVolumeAppInfo extends LocationAppInfo {
             }
         }
 
-        // Look up volume/mount fresh for the action
+        // Look up volume fresh for the action, then get its mount
         const volume = this._lookupVolume();
-        const mount = this.mount;  // Use cached mount reference
+        const mount = volume?.get_mount() ?? null;
 
         if (!volume && !mount) {
             throw new Error('Volume/mount no longer available for action %s'.format(action));
@@ -1658,8 +1660,22 @@ export class Removables {
     }
 
     _onMountRemoved(mount) {
-        // Find the volumeApp whose mount matches
-        const volumeApp = this._volumeApps.find(({appInfo}) => appInfo.mount === mount);
+        // Get volume identifiers from the mount to find matching volumeApp
+        // The mount object is valid during signal handler execution
+        let volumeApp = null;
+        try {
+            const volume = mount.get_volume();
+            if (volume) {
+                const uuid = volume.get_uuid?.();
+                const device = volume.get_identifier?.('unix-device');
+                volumeApp = this._findVolumeAppByIds(uuid, device);
+            }
+        } catch (e) {
+            // Mount or volume may be partially disposed - find by mount state
+            // Fall back to finding volumeApps that are marked as mounted
+            volumeApp = this._volumeApps.find(({appInfo}) => appInfo._isMounted);
+        }
+
         if (!volumeApp)
             return;
 
@@ -1671,6 +1687,8 @@ export class Removables {
             const volume = volumeApp.appInfo._lookupVolume();
             if (volume)
                 volumeApp.appInfo.refresh(volume);
+            else
+                volumeApp.appInfo.markRemoved();
             this.emit('changed');
         }
     }
