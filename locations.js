@@ -1569,8 +1569,10 @@ export class Removables {
             () => this.emit('windows-changed', volumeApp));
 
         if (Docking.DockManager.settings.showMountsOnlyMounted) {
+            // Pass volumeApp directly to avoid accessing appInfo.volume
+            // which could reference a disposed GProxyVolume
             volumeApp._signalConnections.add(appInfo, 'notify::mount',
-                () => !appInfo.mount && this._onVolumeRemoved(appInfo.volume));
+                () => !appInfo.mount && this._removeVolumeApp(volumeApp));
         }
 
         this._volumeApps.push(volumeApp);
@@ -1578,18 +1580,40 @@ export class Removables {
     }
 
     _onVolumeRemoved(volume) {
-        const volumeIndex = this._volumeApps.findIndex(({appInfo}) =>
-            appInfo.volume === volume);
-        if (volumeIndex !== -1) {
-            const [volumeApp] = this._volumeApps.splice(volumeIndex, 1);
-            // Invalidate volume reference FIRST to prevent any subsequent access
-            // to the potentially disposed GProxyVolume object
-            volumeApp.appInfo.invalidateVolume();
-            // Cancel ongoing operations
-            volumeApp.appInfo.cancellable?.cancel();
-            volumeApp.destroy();
-            this.emit('changed');
-        }
+        // Match by cached identifiers instead of comparing appInfo.volume
+        // directly, since appInfo.volume could reference a disposed object
+        const volumeUuid = volume.get_uuid?.();
+        const volumeDevice = volume.get_identifier?.('unix-device');
+
+        const volumeIndex = this._volumeApps.findIndex(({appInfo}) => {
+            const ids = appInfo._volumeIdentifiers;
+            if (!ids)
+                return false;
+            // Match by UUID if available, otherwise by device path
+            if (volumeUuid && ids.uuid)
+                return ids.uuid === volumeUuid;
+            if (volumeDevice && ids.device)
+                return ids.device === volumeDevice;
+            return false;
+        });
+
+        if (volumeIndex !== -1)
+            this._removeVolumeApp(this._volumeApps[volumeIndex]);
+    }
+
+    _removeVolumeApp(volumeApp) {
+        const volumeIndex = this._volumeApps.indexOf(volumeApp);
+        if (volumeIndex === -1)
+            return;
+
+        this._volumeApps.splice(volumeIndex, 1);
+        // Invalidate volume reference FIRST to prevent any subsequent access
+        // to the potentially disposed GProxyVolume object
+        volumeApp.appInfo.invalidateVolume();
+        // Cancel ongoing operations
+        volumeApp.appInfo.cancellable?.cancel();
+        volumeApp.destroy();
+        this.emit('changed');
     }
 
     _onMountAdded(mount) {
