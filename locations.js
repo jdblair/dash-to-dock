@@ -454,13 +454,16 @@ class MountableVolumeAppInfo extends LocationAppInfo {
         });
 
         // Cache volume identifiers for safe lookup after disposal.
-        // This allows us to look up the volume from VolumeMonitor
-        // instead of holding a direct reference that can become invalid.
+        // Also store a direct reference for identity comparison.
         this._volumeIdentifiers = {
             uuid: volume.get_uuid(),
             device: volume.get_identifier('unix-device'),
             name: volume.get_name(),
         };
+        // Store direct reference for safe lookup by identity comparison.
+        // We validate this reference is still in VolumeMonitor before using it,
+        // which avoids calling methods on potentially-disposed volumes.
+        this._volumeRef = volume;
         // Cache the ID string for use in error handlers where we can't
         // safely access the volume.
         this._cachedId = this._volumeIdentifiers.uuid
@@ -497,39 +500,27 @@ class MountableVolumeAppInfo extends LocationAppInfo {
     }
 
     /**
-     * Safe accessor for volume that looks up from VolumeMonitor by cached identifiers.
-     * Returns null if volume is no longer available (removed/disposed).
-     * This avoids holding a direct reference that can become invalid when gvfs
-     * disposes the GProxyVolume object.
+     * Safe accessor for volume that validates our stored reference is still
+     * in VolumeMonitor. Returns null if volume is no longer available.
+     *
+     * IMPORTANT: We use reference identity comparison (Array.includes) rather
+     * than calling methods like get_uuid() on volumes in the list. This is
+     * critical because calling methods on a volume that's being disposed by
+     * gvfs can corrupt the heap at the C level before JavaScript exception
+     * handling can intervene.
      */
     get _safeVolume() {
-        // If identifiers were cleared (volume removed), return null
-        if (!this._volumeIdentifiers)
+        // If invalidated or reference was never stored, return null
+        if (!this._volumeIdentifiers || !this._volumeRef)
             return null;
 
-        const {uuid, device} = this._volumeIdentifiers;
+        const volumes = Gio.VolumeMonitor.get().get_volumes();
 
-        // No identifiers to look up by
-        if (!uuid && !device)
-            return null;
-
-        const monitor = Gio.VolumeMonitor.get();
-        const volumes = monitor.get_volumes();
-
-        // Try to find by UUID first (most reliable)
-        if (uuid) {
-            const byUuid = volumes.find(v => v.get_uuid() === uuid);
-            if (byUuid)
-                return byUuid;
-        }
-
-        // Fall back to device path
-        if (device) {
-            const byDevice = volumes.find(v =>
-                v.get_identifier('unix-device') === device);
-            if (byDevice)
-                return byDevice;
-        }
+        // Check by reference identity - this does NOT call any methods on the
+        // volume objects, avoiding the risk of accessing a disposed object.
+        // Array.includes uses SameValueZero comparison (like ===).
+        if (volumes.includes(this._volumeRef))
+            return this._volumeRef;
 
         // Volume not found in monitor - it's been removed
         return null;
@@ -544,11 +535,12 @@ class MountableVolumeAppInfo extends LocationAppInfo {
     }
 
     /**
-     * Called when the volume is being removed. Clears cached identifiers
-     * so subsequent lookups will return null instead of finding a stale volume.
+     * Called when the volume is being removed. Clears all references and
+     * identifiers so subsequent lookups will return null.
      */
     invalidateVolume() {
         this._volumeIdentifiers = null;
+        this._volumeRef = null;
         this._signalsHandler.destroy();
         this.mount = null;
     }
@@ -560,6 +552,7 @@ class MountableVolumeAppInfo extends LocationAppInfo {
         }
         this.disconnect(this._mountChanged);
         this.mount = null;
+        this._volumeRef = null;
         this._signalsHandler.destroy();
 
         super.destroy();
