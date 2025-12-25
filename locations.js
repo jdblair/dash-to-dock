@@ -466,6 +466,11 @@ class MountableVolumeAppInfo extends LocationAppInfo {
             device: volume.get_identifier('unix-device'),
         };
 
+        // Store volume reference for identity-based lookup.
+        // We use Array.includes() for safe identity comparison without
+        // calling any methods on potentially disposed GObjects.
+        this._volumeRef = volume;
+
         // Cache the ID string for use everywhere.
         this._cachedId = this._volumeId.uuid
             ? 'mountable-volume:%s'.format(this._volumeId.uuid)
@@ -509,35 +514,20 @@ class MountableVolumeAppInfo extends LocationAppInfo {
     }
 
     /**
-     * Look up volume fresh from VolumeMonitor by cached identifiers.
-     * Used only for mount/eject actions where we need a live reference.
-     * Returns null if volume is no longer available.
+     * Look up volume using identity comparison.
+     * Uses Array.includes() which compares by reference identity (===),
+     * safe even for disposed GObjects because it doesn't call any methods.
+     * Returns null if volume is no longer in VolumeMonitor.
      */
     _lookupVolume() {
-        if (!this._volumeId)
-            return null;
-
-        const {uuid, device} = this._volumeId;
-        if (!uuid && !device)
+        if (!this._volumeRef)
             return null;
 
         const volumes = Gio.VolumeMonitor.get().get_volumes();
 
-        // Find by identifier - wrap each access in try/catch in case
-        // a volume in the list is being disposed
-        for (const v of volumes) {
-            try {
-                if (uuid && v.get_uuid() === uuid)
-                    return v;
-                if (device && v.get_identifier('unix-device') === device)
-                    return v;
-            } catch (e) {
-                // Skip volumes that throw - they may be disposed
-                continue;
-            }
-        }
-
-        return null;
+        // Use identity comparison - safe because it doesn't call methods
+        // on any volume, just compares object references
+        return volumes.includes(this._volumeRef) ? this._volumeRef : null;
     }
 
     /**
@@ -566,6 +556,7 @@ class MountableVolumeAppInfo extends LocationAppInfo {
      * Mark this volume as removed. Called when volume-removed signal fires.
      */
     markRemoved() {
+        this._volumeRef = null;
         this._volumeId = null;
         this._isMounted = false;
         this._canUnmount = false;
@@ -577,6 +568,7 @@ class MountableVolumeAppInfo extends LocationAppInfo {
             GLib.source_remove(this._lazyUpdater);
             delete this._lazyUpdater;
         }
+        this._volumeRef = null;
         this._volumeId = null;
         this._isMounted = false;
         this._canUnmount = false;
@@ -1604,21 +1596,18 @@ export class Removables {
     }
 
     _onVolumeRemoved(volume) {
-        // Volume is valid during this signal handler
-        const volumeUuid = volume.get_uuid?.();
-        const volumeDevice = volume.get_identifier?.('unix-device');
-
-        const volumeApp = this._findVolumeAppByIds(volumeUuid, volumeDevice);
+        // Find by identity - safer than calling methods on potentially
+        // disposed objects
+        const volumeApp = this._volumeApps.find(
+            ({appInfo}) => appInfo._volumeRef === volume);
         if (volumeApp)
             this._removeVolumeApp(volumeApp);
     }
 
     _onVolumeChanged(volume) {
-        // Volume is valid during this signal handler - use it to refresh
-        const volumeUuid = volume.get_uuid?.();
-        const volumeDevice = volume.get_identifier?.('unix-device');
-
-        const volumeApp = this._findVolumeAppByIds(volumeUuid, volumeDevice);
+        // Find by identity for safety
+        const volumeApp = this._volumeApps.find(
+            ({appInfo}) => appInfo._volumeRef === volume);
         if (volumeApp)
             volumeApp.appInfo.refresh(volume);
     }
@@ -1641,14 +1630,27 @@ export class Removables {
         Removables.initMountPromises(mount);
 
         // Get the volume for this mount to find matching volumeApp
-        const volume = mount.get_volume();
+        // Use try/catch in case volume is in an unexpected state
+        let volume;
+        try {
+            volume = mount.get_volume();
+        } catch (e) {
+            // Mount may be in an inconsistent state - ignore
+            return;
+        }
         if (!volume)
             return;
 
-        const volumeUuid = volume.get_uuid?.();
-        const volumeDevice = volume.get_identifier?.('unix-device');
+        // Find by identity first (safer), fall back to ID lookup
+        let existingApp = this._volumeApps.find(
+            ({appInfo}) => appInfo._volumeRef === volume);
+        if (!existingApp) {
+            // Volume reference might have changed, try by cached IDs
+            const volumeUuid = volume.get_uuid?.();
+            const volumeDevice = volume.get_identifier?.('unix-device');
+            existingApp = this._findVolumeAppByIds(volumeUuid, volumeDevice);
+        }
 
-        const existingApp = this._findVolumeAppByIds(volumeUuid, volumeDevice);
         if (existingApp) {
             // Refresh existing volumeApp with new mount state
             existingApp.appInfo.refresh(volume);
@@ -1660,37 +1662,51 @@ export class Removables {
     }
 
     _onMountRemoved(mount) {
-        // Get volume identifiers from the mount to find matching volumeApp
-        // The mount object is valid during signal handler execution
-        let volumeApp = null;
-        try {
-            const volume = mount.get_volume();
-            if (volume) {
-                const uuid = volume.get_uuid?.();
-                const device = volume.get_identifier?.('unix-device');
-                volumeApp = this._findVolumeAppByIds(uuid, device);
-            }
-        } catch (e) {
-            // Mount or volume may be partially disposed - find by mount state
-            // Fall back to finding volumeApps that are marked as mounted
-            volumeApp = this._volumeApps.find(({appInfo}) => appInfo._isMounted);
-        }
+        // IMPORTANT: Do NOT call mount.get_volume() - the volume may already
+        // be disposed by gvfs, and calling any method on it corrupts the heap
+        // at the C level before JavaScript exception handling can intervene.
+        //
+        // Instead, iterate all volumeApps that are marked as mounted and
+        // check if their volume is still mounted using identity-safe lookup.
 
-        if (!volumeApp)
-            return;
+        const mountedApps = this._volumeApps.filter(({appInfo}) => appInfo._isMounted);
 
-        if (Docking.DockManager.settings.showMountsOnlyMounted) {
-            // Remove the volumeApp when mount is removed
-            this._removeVolumeApp(volumeApp);
-        } else {
-            // Just refresh to clear mount state
+        for (const volumeApp of mountedApps) {
+            // Use identity-based lookup (safe - no method calls on volumes)
             const volume = volumeApp.appInfo._lookupVolume();
-            if (volume)
-                volumeApp.appInfo.refresh(volume);
-            else
-                volumeApp.appInfo.markRemoved();
-            this.emit('changed');
+
+            if (!volume) {
+                // Volume was removed entirely
+                if (Docking.DockManager.settings.showMountsOnlyMounted)
+                    this._removeVolumeApp(volumeApp);
+                else
+                    volumeApp.appInfo.markRemoved();
+                continue;
+            }
+
+            // Volume still exists - check if it still has a mount
+            // This is safe because _lookupVolume verified volume is in VolumeMonitor
+            try {
+                const currentMount = volume.get_mount();
+                if (!currentMount) {
+                    // Mount was removed from this volume
+                    if (Docking.DockManager.settings.showMountsOnlyMounted) {
+                        this._removeVolumeApp(volumeApp);
+                    } else {
+                        volumeApp.appInfo.refresh(volume);
+                    }
+                }
+            } catch (e) {
+                // TOCTOU: volume disposed between lookup and get_mount
+                // This window is very small but handle gracefully
+                if (Docking.DockManager.settings.showMountsOnlyMounted)
+                    this._removeVolumeApp(volumeApp);
+                else
+                    volumeApp.appInfo.markRemoved();
+            }
         }
+
+        this.emit('changed');
     }
 
     getApps() {
