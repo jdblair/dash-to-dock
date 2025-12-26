@@ -432,6 +432,9 @@ const RemovableAction = Object.freeze({
 
 const MountableVolumeAppInfo = GObject.registerClass({
     Implements: [Gio.AppInfo],
+    Signals: {
+        'needs-refresh': {},
+    },
     Properties: {
         'volume': GObject.ParamSpec.object(
             'volume', 'volume', 'volume',
