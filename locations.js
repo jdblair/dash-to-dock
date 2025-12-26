@@ -482,13 +482,15 @@ class MountableVolumeAppInfo extends LocationAppInfo {
 
         // Cache static volume properties (don't change during volume lifetime)
         this._isNetworkVolume = volume.get_identifier('class') === 'network';
+        // Cache volume's own eject capability - this doesn't change
+        this._volumeCanEject = volume.can_eject?.() ?? false;
 
         // Cache current mount state as primitives - will be updated via refresh()
         // NO mount GObject reference is stored to avoid accessing disposed objects
         const mount = volume.get_mount();
         this._isMounted = !!mount;
         this._canUnmount = mount?.can_unmount?.() ?? false;
-        this._canEject = mount?.can_eject?.() ?? volume.can_eject?.() ?? false;
+        this._canEject = mount?.can_eject?.() ?? this._volumeCanEject;
 
         // Set properties from current state
         this.name = (mount ?? volume).get_name() ?? 'Unknown';
@@ -546,7 +548,8 @@ class MountableVolumeAppInfo extends LocationAppInfo {
         const mount = volume.get_mount();
         this._isMounted = !!mount;
         this._canUnmount = mount?.can_unmount?.() ?? false;
-        this._canEject = mount?.can_eject?.() ?? volume.can_eject?.() ?? false;
+        // Use cached _volumeCanEject to avoid calling methods on volume later
+        this._canEject = mount?.can_eject?.() ?? this._volumeCanEject;
 
         // Update mutable properties
         this.name = (mount ?? volume).get_name() ?? this.name ?? 'Unknown';
@@ -1477,7 +1480,7 @@ export class Removables {
         this._monitor.get_mounts().forEach(m => Removables.initMountPromises(m));
         this._updateVolumes();
 
-        // v7: Connect to all VolumeMonitor signals for state updates.
+        // Connect to VolumeMonitor signals for state updates.
         // Individual volume/mount objects are NOT connected to directly.
         this._signalsHandler.add([
             this._monitor,
@@ -1557,7 +1560,7 @@ export class Removables {
         volumeApp._signalConnections.add(volumeApp, 'windows-changed',
             () => this.emit('windows-changed', volumeApp));
 
-        // v7: Handle needs-refresh signal for network volumes
+        // Handle needs-refresh signal for network volumes
         volumeApp._signalConnections.add(appInfo, 'needs-refresh',
             () => this._refreshVolumeAppByIds(appInfo._volumeId));
 
@@ -1665,48 +1668,53 @@ export class Removables {
     }
 
     _onMountRemoved(mount) {
-        // IMPORTANT: Do NOT call mount.get_volume() - the volume may already
-        // be disposed by gvfs, and calling any method on it corrupts the heap
-        // at the C level before JavaScript exception handling can intervene.
+        // Use the mount object passed to this signal handler (safe) to
+        // identify which volumeApp was unmounted. Match by location URI string.
         //
-        // Instead, iterate all volumeApps that are marked as mounted and
-        // check if their volume is still mounted using identity-safe lookup.
+        // CRITICAL: Do NOT call mount.get_volume() or any methods on stored
+        // volume references. The underlying GProxyVolume may already be disposed
+        // by gvfs, and calling ANY method corrupts the heap at the C level
+        // before JavaScript exception handling can intervene.
+        //
+        // Array.includes() for identity comparison is NOT safe either - the JS
+        // wrapper can outlive the C object, so includes() returns true but
+        // calling methods on the "found" object still corrupts the heap.
 
-        const mountedApps = this._volumeApps.filter(({appInfo}) => appInfo._isMounted);
-
-        for (const volumeApp of mountedApps) {
-            // Use identity-based lookup (safe - no method calls on volumes)
-            const volume = volumeApp.appInfo._lookupVolume();
-
-            if (!volume) {
-                // Volume was removed entirely
-                if (Docking.DockManager.settings.showMountsOnlyMounted)
-                    this._removeVolumeApp(volumeApp);
-                else
-                    volumeApp.appInfo.markRemoved();
-                continue;
-            }
-
-            // Volume still exists - check if it still has a mount
-            // This is safe because _lookupVolume verified volume is in VolumeMonitor
-            try {
-                const currentMount = volume.get_mount();
-                if (!currentMount) {
-                    // Mount was removed from this volume
-                    if (Docking.DockManager.settings.showMountsOnlyMounted) {
-                        this._removeVolumeApp(volumeApp);
-                    } else {
-                        volumeApp.appInfo.refresh(volume);
-                    }
+        // Get the mount's location URI - the mount object is safe to use
+        // because it was passed directly from the signal
+        let mountUri;
+        try {
+            mountUri = mount.get_default_location()?.get_uri();
+        } catch (e) {
+            // Mount in unexpected state - mark all mounted volumeApps as unmounted
+            for (const {appInfo} of this._volumeApps) {
+                if (appInfo._isMounted) {
+                    appInfo._isMounted = false;
+                    appInfo._canUnmount = false;
+                    appInfo._canEject = appInfo._volumeCanEject;
                 }
-            } catch (e) {
-                // TOCTOU: volume disposed between lookup and get_mount
-                // This window is very small but handle gracefully
-                if (Docking.DockManager.settings.showMountsOnlyMounted)
-                    this._removeVolumeApp(volumeApp);
-                else
-                    volumeApp.appInfo.markRemoved();
             }
+            if (Docking.DockManager.settings.showMountsOnlyMounted)
+                this._updateVolumes();
+            else
+                this.emit('changed');
+            return;
+        }
+
+        // Find volumeApp by location URI (string comparison - completely safe)
+        const volumeApp = mountUri
+            ? this._volumeApps.find(({appInfo}) =>
+                appInfo.location?.get_uri() === mountUri)
+            : null;
+
+        if (volumeApp) {
+            // Update cached state - no GObject method calls needed
+            volumeApp.appInfo._isMounted = false;
+            volumeApp.appInfo._canUnmount = false;
+            volumeApp.appInfo._canEject = volumeApp.appInfo._volumeCanEject;
+
+            if (Docking.DockManager.settings.showMountsOnlyMounted)
+                this._removeVolumeApp(volumeApp);
         }
 
         this.emit('changed');
