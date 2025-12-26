@@ -482,7 +482,8 @@ class MountableVolumeAppInfo extends LocationAppInfo {
 
         // Cache static volume properties (don't change during volume lifetime)
         this._isNetworkVolume = volume.get_identifier('class') === 'network';
-        // Cache volume's own eject capability - this doesn't change
+        // Cache volume's own capabilities - these don't change
+        this._volumeCanMount = volume.can_mount?.() ?? false;
         this._volumeCanEject = volume.can_eject?.() ?? false;
 
         // Cache current mount state as primitives - will be updated via refresh()
@@ -517,23 +518,6 @@ class MountableVolumeAppInfo extends LocationAppInfo {
 
     get currentAction() {
         return this._currentAction;
-    }
-
-    /**
-     * Look up volume using identity comparison.
-     * Uses Array.includes() which compares by reference identity (===),
-     * safe even for disposed GObjects because it doesn't call any methods.
-     * Returns null if volume is no longer in VolumeMonitor.
-     */
-    _lookupVolume() {
-        if (!this._volumeRef)
-            return null;
-
-        const volumes = Gio.VolumeMonitor.get().get_volumes();
-
-        // Use identity comparison - safe because it doesn't call methods
-        // on any volume, just compares object references
-        return volumes.includes(this._volumeRef) ? this._volumeRef : null;
     }
 
     /**
@@ -585,11 +569,9 @@ class MountableVolumeAppInfo extends LocationAppInfo {
     }
 
     vfunc_dup() {
-        // Look up volume fresh for duplication
-        const volume = this._lookupVolume();
-        if (!volume)
-            return null;
-        return new MountableVolumeAppInfo(volume, this.cancellable);
+        // Duplication requires a live volume reference which we can't safely
+        // obtain. Return null - callers should handle this gracefully.
+        return null;
     }
 
     vfunc_get_id() {
@@ -607,27 +589,18 @@ class MountableVolumeAppInfo extends LocationAppInfo {
     list_actions() {
         const actions = [];
 
-        // Use cached mount state - no GObject method calls needed
+        // Use cached state only - no GObject method calls needed
         if (this._isMounted) {
             if (this._canUnmount)
                 actions.push(RemovableAction.UNMOUNT);
             if (this._canEject)
                 actions.push(RemovableAction.EJECT);
-            return actions;
-        }
-
-        // Not mounted - check if we can mount or eject
-        // Look up volume fresh for capability check
-        const volume = this._lookupVolume();
-        if (volume) {
-            try {
-                if (volume.can_mount?.())
-                    actions.push(RemovableAction.MOUNT);
-                if (volume.can_eject?.())
-                    actions.push(RemovableAction.EJECT);
-            } catch (e) {
-                // Volume disposed during lookup - return empty actions
-            }
+        } else {
+            // Not mounted - use cached volume capabilities
+            if (this._volumeCanMount)
+                actions.push(RemovableAction.MOUNT);
+            if (this._volumeCanEject)
+                actions.push(RemovableAction.EJECT);
         }
 
         return actions;
@@ -722,37 +695,45 @@ class MountableVolumeAppInfo extends LocationAppInfo {
             }
         }
 
-        // Look up volume fresh for the action, then get its mount
-        const volume = this._lookupVolume();
-        const mount = volume?.get_mount() ?? null;
-
-        if (!volume && !mount) {
-            throw new Error('Volume/mount no longer available for action %s'.format(action));
-        }
+        // Use GFile-based operations to avoid accessing stored volume references.
+        // This prevents heap corruption from disposed GProxyVolume objects.
+        //
+        // - MOUNT: location.mount_enclosing_volume()
+        // - UNMOUNT: location.find_enclosing_mount() -> mount.unmount()
+        // - EJECT: location.find_enclosing_mount() -> mount.eject(), or gio CLI
 
         this._currentAction = action;
         this.notify('busy');
-        const removable = mount ?? volume;
-        const operation = new ShellMountOperation.ShellMountOperation(removable);
+
+        // Create mount operation for auth dialogs (null source is acceptable)
+        const operation = new ShellMountOperation.ShellMountOperation(null);
         try {
             switch (action) {
             case RemovableAction.MOUNT:
-                if (!volume)
-                    throw new Error('Volume not available for mount');
-                await volume.mount(Gio.MountMountFlags.NONE, operation.mountOp,
-                    this.cancellable);
+                // Use GFile.mount_enclosing_volume - no volume reference needed
+                await this.location.mount_enclosing_volume(
+                    Gio.MountMountFlags.NONE, operation.mountOp, this.cancellable);
                 return true;
 
-            case RemovableAction.UNMOUNT:
-                if (!mount)
-                    throw new Error('Mount not available for unmount');
+            case RemovableAction.UNMOUNT: {
+                // Get mount fresh from the location's GFile
+                const mount = await this.location.find_enclosing_mount(this.cancellable);
                 await mount.unmount_with_operation(Gio.MountUnmountFlags.FORCE,
                     operation.mountOp, this.cancellable);
                 return true;
+            }
 
             case RemovableAction.EJECT:
-                await removable.eject_with_operation(Gio.MountUnmountFlags.FORCE,
-                    operation.mountOp, this.cancellable);
+                if (this._isMounted) {
+                    // Get mount fresh from the location's GFile and eject it
+                    const mount = await this.location.find_enclosing_mount(this.cancellable);
+                    await mount.eject_with_operation(Gio.MountUnmountFlags.FORCE,
+                        operation.mountOp, this.cancellable);
+                } else {
+                    // Not mounted - use gio CLI with cached device path
+                    // This avoids any volume reference access
+                    await this._ejectUnmountedVolume();
+                }
                 return true;
 
             default:
@@ -788,6 +769,29 @@ class MountableVolumeAppInfo extends LocationAppInfo {
             this.notify('busy');
             // State will be updated via VolumeMonitor signals (mount-added/mount-removed)
             operation.close();
+        }
+    }
+
+    /**
+     * Eject an unmounted volume using gio CLI.
+     * This avoids accessing stored volume references which may be disposed.
+     */
+    async _ejectUnmountedVolume() {
+        const device = this._volumeId?.device;
+        if (!device)
+            throw new Error('No device path available for eject');
+
+        // Use gio mount -e which handles unmounted volumes
+        const proc = Gio.Subprocess.new(
+            ['gio', 'mount', '-e', device],
+            Gio.SubprocessFlags.NONE);
+        await proc.wait_async(this.cancellable);
+
+        if (!proc.get_successful()) {
+            throw new GLib.Error(
+                Gio.IOErrorEnum,
+                Gio.IOErrorEnum.FAILED,
+                'Failed to eject %s'.format(device));
         }
     }
 
@@ -1588,18 +1592,15 @@ export class Removables {
     /**
      * Find and refresh a volumeApp by cached identifiers.
      * Used for delayed refresh requests from network volumes.
+     *
+     * Note: We no longer perform delayed refresh because it would require
+     * calling methods on volume objects which may be disposed. Network
+     * volumes will get proper state updates via mount-added/mount-removed
+     * signals instead.
      */
-    _refreshVolumeAppByIds(volumeId) {
-        if (!volumeId)
-            return;
-        const volumeApp = this._findVolumeAppByIds(volumeId.uuid, volumeId.device);
-        if (!volumeApp)
-            return;
-
-        // Look up volume fresh and refresh
-        const volume = volumeApp.appInfo._lookupVolume();
-        if (volume)
-            volumeApp.appInfo.refresh(volume);
+    _refreshVolumeAppByIds(_volumeId) {
+        // Intentionally empty - see comment above.
+        // The volumeApp will be updated when VolumeMonitor signals fire.
     }
 
     _onVolumeRemoved(volume) {
