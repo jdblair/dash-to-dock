@@ -1481,6 +1481,7 @@ export class Removables {
         this._monitor = Gio.VolumeMonitor.get();
         this._cancellable = new Gio.Cancellable();
 
+        // Rule 6: Initialization is safe - promisify prototypes at startup
         this._monitor.get_mounts().forEach(m => Removables.initMountPromises(m));
         this._updateVolumes();
 
@@ -1509,11 +1510,14 @@ export class Removables {
         ], [
             Docking.DockManager.settings,
             'changed::show-mounts-only-mounted',
-            () => this._updateVolumes(),
+            () => {
+                // getApps() handles filtering, just notify UI
+                this.emit('changed');
+            },
         ], [
             Docking.DockManager.settings,
             'changed::show-mounts-network',
-            () => this._updateVolumes(),
+            () => this._onShowMountsNetworkChanged(),
         ]);
     }
 
@@ -1526,12 +1530,39 @@ export class Removables {
         this._monitor = null;
     }
 
+    /**
+     * Initialize volume list at startup.
+     *
+     * Rule 6: Initialization is a special case. Iterating get_volumes() at
+     * startup is relatively safe because no volumes are being concurrently
+     * disposed. This should ONLY be called from the constructor.
+     */
     _updateVolumes() {
         this._volumeApps?.forEach(a => a.destroy());
         this._volumeApps = [];
         this.emit('changed');
 
         this._monitor.get_volumes().forEach(v => this._onVolumeAdded(v));
+    }
+
+    /**
+     * Handle show-mounts-network setting change.
+     * Filters existing volumeApps without iterating VolumeMonitor.
+     */
+    _onShowMountsNetworkChanged() {
+        const showNetwork = Docking.DockManager.settings.showMountsNetwork;
+
+        if (!showNetwork) {
+            // Remove network volumeApps
+            const networkApps = this._volumeApps.filter(
+                ({appInfo}) => appInfo._isNetworkVolume);
+            networkApps.forEach(app => this._removeVolumeApp(app));
+        }
+        // Note: If setting changed to show network volumes, new ones will
+        // appear via volume-added signals when they're mounted. We don't
+        // iterate get_volumes() because that would violate Rule 1.
+
+        this.emit('changed');
     }
 
     _onVolumeAdded(volume) {
@@ -1541,6 +1572,8 @@ export class Removables {
             volume.get_identifier('class') === 'network')
             return;
 
+        // Check mount state and capabilities. Note: volume.get_mount() is safe
+        // here because volume was passed from the signal handler and is valid.
         const mount = volume.get_mount();
         if (mount) {
             if (mount.is_shadowed())
@@ -1548,8 +1581,9 @@ export class Removables {
             if (!mount.can_eject() && !mount.can_unmount())
                 return;
         } else {
-            if (Docking.DockManager.settings.showMountsOnlyMounted)
-                return;
+            // Always create volumeApp even if not mounted - we filter in
+            // getApps() based on showMountsOnlyMounted setting. This avoids
+            // needing to call mount.get_volume() in _onMountAdded.
             if (!volume.can_mount() && !volume.can_eject())
                 return;
         }
@@ -1637,35 +1671,58 @@ export class Removables {
     _onMountAdded(mount) {
         Removables.initMountPromises(mount);
 
-        // Use try/catch in case volume is in an unexpected state
-        let volume;
+        // Rule 3: Don't call mount.get_volume() - the returned volume may be
+        // disposed. Instead, match by mount URI which we can safely get from
+        // the mount object passed to this signal handler.
+
+        let mountUri;
         try {
-            volume = mount.get_volume();
+            mountUri = mount.get_default_location()?.get_uri();
         } catch (e) {
-            // Mount may be in an inconsistent state - ignore
+            // Mount in unexpected state
             return;
         }
-        if (!volume)
+        if (!mountUri)
             return;
 
-        // Find by identity first (safer), fall back to ID lookup
-        let existingApp = this._volumeApps.find(
-            ({appInfo}) => appInfo._volumeRef === volume);
+        // Find volumeApp by URI - this matches activation roots
+        let existingApp = this._volumeApps.find(({appInfo}) =>
+            appInfo.location?.get_uri() === mountUri);
+
+        // Also try matching by activation root pattern (some volumes use
+        // different URIs for activation root vs mount location)
         if (!existingApp) {
-            // Volume reference might have changed, try by cached IDs
-            const volumeUuid = volume.get_uuid?.();
-            const volumeDevice = volume.get_identifier?.('unix-device');
-            existingApp = this._findVolumeAppByIds(volumeUuid, volumeDevice);
+            // Try matching by checking if mount URI starts with volume's location
+            existingApp = this._volumeApps.find(({appInfo}) => {
+                const volumeUri = appInfo.location?.get_uri();
+                return volumeUri && (mountUri.startsWith(volumeUri) ||
+                                     volumeUri.startsWith(mountUri));
+            });
         }
 
         if (existingApp) {
-            // Refresh existing volumeApp with new mount state
-            existingApp.appInfo.refresh(volume);
+            // Update mount state from the mount object (safe - from signal)
+            existingApp.appInfo._isMounted = true;
+            try {
+                existingApp.appInfo._canUnmount = mount.can_unmount?.() ?? false;
+                existingApp.appInfo._canEject = mount.can_eject?.() ??
+                    existingApp.appInfo._volumeCanEject;
+                existingApp.appInfo.location = mount.get_default_location() ??
+                    existingApp.appInfo.location;
+                const icon = mount.get_icon?.();
+                if (icon)
+                    existingApp.appInfo.icon = icon;
+                const name = mount.get_name?.();
+                if (name)
+                    existingApp.appInfo.name = name;
+            } catch (e) {
+                // Mount methods failed - just mark as mounted
+            }
             this.emit('changed');
-        } else if (Docking.DockManager.settings.showMountsOnlyMounted) {
-            // Create new volumeApp for newly mounted volume
-            this._onVolumeAdded(volume);
         }
+        // Note: If no existing volumeApp found, the volume-added signal will
+        // handle creating it. We no longer call _onVolumeAdded here because
+        // that would require calling mount.get_volume() which is unsafe.
     }
 
     _onMountRemoved(mount) {
@@ -1695,10 +1752,8 @@ export class Removables {
                     appInfo._canEject = appInfo._volumeCanEject;
                 }
             }
-            if (Docking.DockManager.settings.showMountsOnlyMounted)
-                this._updateVolumes();
-            else
-                this.emit('changed');
+            // getApps() handles showMountsOnlyMounted filtering
+            this.emit('changed');
             return;
         }
 
@@ -1722,6 +1777,9 @@ export class Removables {
     }
 
     getApps() {
+        // Filter based on showMountsOnlyMounted setting
+        if (Docking.DockManager.settings.showMountsOnlyMounted)
+            return this._volumeApps.filter(({appInfo}) => appInfo._isMounted);
         return this._volumeApps;
     }
 }
