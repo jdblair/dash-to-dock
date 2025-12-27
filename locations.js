@@ -552,6 +552,10 @@ class MountableVolumeAppInfo extends LocationAppInfo {
         this._isMounted = false;
         this._canUnmount = false;
         this._canEject = false;
+        // Also clear volume capabilities so list_actions() returns empty
+        // This prevents actions from being performed on removed volumes
+        this._volumeCanMount = false;
+        this._volumeCanEject = false;
     }
 
     destroy() {
@@ -564,6 +568,8 @@ class MountableVolumeAppInfo extends LocationAppInfo {
         this._isMounted = false;
         this._canUnmount = false;
         this._canEject = false;
+        this._volumeCanMount = false;
+        this._volumeCanEject = false;
 
         super.destroy();
     }
